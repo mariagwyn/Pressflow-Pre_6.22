@@ -1,5 +1,5 @@
 <?php
-// $Id: common.inc,v 1.756.2.49 2009/04/30 00:13:30 goba Exp $
+// $Id: common.inc,v 1.756.2.52 2009/05/13 19:11:04 goba Exp $
 
 /**
  * @file
@@ -125,30 +125,23 @@ function drupal_clear_path_cache() {
   drupal_lookup_path('wipe');
 }
 
-/**
- * Set an HTTP response header for the current page.
- *
- * Note: When sending a Content-Type header, always include a 'charset' type,
- * too. This is necessary to avoid security bugs (e.g. UTF-7 XSS).
+/*
+ * The function drupal_set_header() has been moved to includes/bootstrap.inc in Pressflow.
  */
-function drupal_set_header($header = NULL) {
-  // We use an array to guarantee there are no leading or trailing delimiters.
-  // Otherwise, header('') could get called when serving the page later, which
-  // ends HTTP headers prematurely on some PHP versions.
-  static $stored_headers = array();
-
-  if (strlen($header)) {
-    header($header);
-    $stored_headers[] = $header;
-  }
-  return implode("\n", $stored_headers);
-}
 
 /**
  * Get the HTTP response headers for the current page.
+ *
+ * This function is not called by Pressflow and remains here
+ * only for Drupal 5/6 API compatibility.
  */
 function drupal_get_headers() {
-  return drupal_set_header();
+  $headers = drupal_set_header();
+  $header_text = array();
+  foreach ($headers as $name => $value) {
+    $header_text[] .= $name . ': ' . $value;
+  }
+  return implode("\n", $header_text);
 }
 
 /**
@@ -321,9 +314,9 @@ function drupal_goto($path = '', $query = NULL, $fragment = NULL, $http_response
     module_invoke_all('exit', $url);
   }
 
-  // Even though session_write_close() is registered as a shutdown function, we
-  // need all session data written to the database before redirecting.
-  session_write_close();
+  // Even though session_write_close() is registered as a shutdown function,
+  // we need all session data written to the database before redirecting.
+  drupal_session_write();
 
   header('Location: '. $url, TRUE, $http_response_code);
 
@@ -352,11 +345,6 @@ function drupal_not_found() {
 
   watchdog('page not found', check_plain($_GET['q']), NULL, WATCHDOG_WARNING);
 
-  // Keep old path for reference.
-  if (!isset($_REQUEST['destination'])) {
-    $_REQUEST['destination'] = $_GET['q'];
-  }
-
   $path = drupal_get_normal_path(variable_get('site_404', ''));
   if ($path && $path != $_GET['q']) {
     // Set the active item in case there are tabs to display, or other
@@ -379,12 +367,8 @@ function drupal_not_found() {
  */
 function drupal_access_denied() {
   drupal_set_header('HTTP/1.1 403 Forbidden');
-  watchdog('access denied', check_plain($_GET['q']), NULL, WATCHDOG_WARNING);
 
-  // Keep old path for reference.
-  if (!isset($_REQUEST['destination'])) {
-    $_REQUEST['destination'] = $_GET['q'];
-  }
+  watchdog('access denied', check_plain($_GET['q']), NULL, WATCHDOG_WARNING);
 
   $path = drupal_get_normal_path(variable_get('site_403', ''));
   if ($path && $path != $_GET['q']) {
@@ -1577,6 +1561,11 @@ function l($text, $path, $options = array()) {
  * react to the closing of the page by calling hook_exit().
  */
 function drupal_page_footer() {
+  global $user;
+
+  // Write the session, and open one if needed.
+  drupal_session_write();
+
   if (variable_get('cache', CACHE_DISABLED) != CACHE_DISABLED) {
     page_set_cache();
   }
@@ -2563,29 +2552,43 @@ function _drupal_bootstrap_full() {
 function page_set_cache() {
   global $user, $base_root;
 
-  if (!$user->uid && $_SERVER['REQUEST_METHOD'] == 'GET' && page_get_cache(TRUE)) {
-    // This will fail in some cases, see page_get_cache() for the explanation.
-    if ($data = ob_get_contents()) {
-      $cache = TRUE;
-      if (variable_get('page_compression', TRUE) && function_exists('gzencode')) {
-        // We do not store the data in case the zlib mode is deflate.
-        // This should be rarely happening.
-        if (zlib_get_coding_type() == 'deflate') {
-          $cache = FALSE;
-        }
-        else if (zlib_get_coding_type() == FALSE) {
-          $data = gzencode($data, 9, FORCE_GZIP);
-        }
-        // The remaining case is 'gzip' which means the data is
-        // already compressed and nothing left to do but to store it.
-      }
-      ob_end_flush();
-      if ($cache && $data) {
-        cache_set($base_root . request_uri(), $data, 'cache_page', CACHE_TEMPORARY, drupal_get_headers());
-      }
+  if (page_is_cacheable()) {
+    $cache_page = TRUE;
+
+    $cache_lifetime = variable_get('page_cache_lifetime', 0);
+
+    $cache = (object) array(
+      'cid' => $base_root . request_uri(),
+      'data' => ob_get_clean(),
+      'expire' => $cache_lifetime > 0 ? $cache_lifetime : CACHE_TEMPORARY,
+      'created' => $_SERVER['REQUEST_TIME'],
+      'headers' => array(),
+    );
+    // Restore preferred header names based on the lower-case names returned
+    // by drupal_get_header().
+    $header_names = _drupal_set_preferred_header_name();
+    foreach (drupal_get_header() as $name_lower => $value) {
+      $cache->headers[$header_names[$name_lower]] = $value;
     }
+    if (variable_get('page_compression', TRUE) && function_exists('gzencode')) {
+      // We do not store the data in case the zlib mode is deflate. This should
+      // be rarely happening.
+      if (zlib_get_coding_type() == 'deflate') {
+        $cache_page = FALSE;
+      }
+      elseif (zlib_get_coding_type() == FALSE) {
+        $cache->data = gzencode($cache->data, 9, FORCE_GZIP);
+      }
+      // The remaining case is 'gzip' which means the data is already
+      // compressed and nothing left to do but to store it.
+    }
+    if ($cache_page && $cache->data) {
+      cache_set($cache->cid, $cache->data, 'cache_page', $cache->expire, serialize($cache->headers));
+    }
+    drupal_page_cache_header($cache);
   }
 }
+
 
 /**
  * Executes a cron run when called

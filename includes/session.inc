@@ -17,11 +17,6 @@ function sess_close() {
 function sess_read($key) {
   global $user;
 
-  // Write and Close handlers are called after destructing objects since PHP 5.0.5
-  // Thus destructors can use sessions but session handler can't use objects.
-  // So we are moving session closure before destructing objects.
-  register_shutdown_function('session_write_close');
-
   // Handle the case of first time visitors and clients that don't store cookies (eg. web crawlers).
   if (!isset($_COOKIE[session_name()])) {
     $user = drupal_anonymous_user();
@@ -56,11 +51,10 @@ function sess_read($key) {
 function sess_write($key, $value) {
   global $user;
 
-  // If saving of session data is disabled or if the client doesn't have a session,
-  // and one isn't being created ($value), do nothing. This keeps crawlers out of
-  // the session table. This reduces memory and server load, and gives more useful
-  // statistics. We can't eliminate anonymous session table rows without breaking
-  // the throttle module and the "Who's Online" block.
+  // If saving of session data is disabled, or if a new empty anonymous session
+  // has been started, do nothing. This keeps anonymous users, including
+  // crawlers, out of the session table, unless they actually have something
+  // stored in $_SESSION.
   if (!session_save_session() || ($user->uid == 0 && empty($_COOKIE[session_name()]) && empty($value))) {
     return TRUE;
   }
@@ -80,6 +74,101 @@ function sess_write($key, $value) {
   }
 
   return TRUE;
+}
+
+/**
+ * Propagate $_SESSION and set session cookie if not already set. This function
+ * should be called before writing to $_SESSION, usually via
+ * drupal_set_session().
+ *
+ * @param $start
+ *   If FALSE, the session is not actually started. This is only used by
+ *   drupal_session_is_started().
+ * @return
+ *   TRUE if session has already been started, or FALSE if it has not.
+ */
+function drupal_session_start($start = TRUE) {
+  global $user;
+  static $started = FALSE;
+  if ($start && !$started) {
+    $started = TRUE;
+
+    // If the user had no session previously, save the user object and the
+    // session data set previously in this request as they will be overriden
+    // by sess_start().
+    if (!isset($_COOKIE[session_name()])) {
+      $saved_user = $user;
+      $saved_session = (array) $_SESSION;
+    }
+
+    // Start the session.
+    session_start();
+
+    // Restore session data.
+    if (!isset($_COOKIE[session_name()])) {
+      $user = $saved_user;
+      $_SESSION += $saved_session;
+    }
+  }
+  return $started;
+}
+
+/**
+ * Return whether a session has been started and the $_SESSION variable is
+ * available.
+ */
+function drupal_session_is_started() {
+  $result = drupal_session_start(FALSE);
+  return $result;
+}
+
+/**
+ * Write the session.
+ */
+function drupal_session_write() {
+  if (!drupal_session_is_started() && !empty($_SESSION)) {
+    drupal_session_start();
+  }
+
+  session_write_close();
+}
+
+/**
+ * Get a session variable.
+ *
+ * @param $name
+ *   The name of the variable to get. If not supplied, all variables are returned.
+ * @return
+ *   The value of the variable, or FALSE if the variable is not set.
+ */
+function drupal_get_session($name = NULL) {
+  if (is_null($name)) {
+    return $_SESSION;
+  }
+  elseif (isset($_SESSION[$name])) {
+    return $_SESSION[$name];
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Set a session variable. The variable becomes accessible via $_SESSION[$name]
+ * in the current and later requests. If there is no active PHP session prior
+ * to the call, one is started automatically.
+ *
+ * Anonymous users generate less server load if their $_SESSION variable is
+ * empty, so unused entries should be unset using unset($_SESSION['foo']).
+ *
+ * @param $name
+ *   The name of the variable to set.
+ * @param $value
+ *   The value to set.
+ */
+function drupal_set_session($name, $value) {
+  drupal_session_start();
+  $_SESSION[$name] = $value;
 }
 
 /**
@@ -127,6 +216,9 @@ function sess_count($timestamp = 0, $anonymous = true) {
  */
 function sess_destroy_sid($sid) {
   db_query("DELETE FROM {sessions} WHERE sid = '%s'", $sid);
+  // Unset cookie.
+  extract(session_get_cookie_params());
+  setcookie(session_name(), '', time() - 3600, $path, $domain, $secure, $httponly);
 }
 
 /**
