@@ -711,11 +711,9 @@ class DrupalWebTestCase extends DrupalTestCase {
   protected function drupalCreateNode($settings = array()) {
     // Populate defaults array.
     $settings += array(
-//      'body'      => array(FIELD_LANGUAGE_NONE => array(array())),
       'body'      => $this->randomName(32),
       'title'     => $this->randomName(8),
       'comment'   => 2,
-//      'changed'   => REQUEST_TIME,
       'changed'   => time(),
       'format'    => FILTER_FORMAT_DEFAULT,
       'moderate'  => 0,
@@ -1494,7 +1492,7 @@ class DrupalWebTestCase extends DrupalTestCase {
             // is broken. This is a less than elegant workaround. Alternatives
             // are being explored at #253506.
             foreach ($upload as $key => $file) {
-              $file = drupal_realpath($file);
+              $file = realpath($file);
               if ($file && is_file($file)) {
                 $post[$key] = '@' . $file;
               }
