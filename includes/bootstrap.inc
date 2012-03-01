@@ -389,6 +389,10 @@ function conf_init() {
   if (count(explode('.', $cookie_domain)) > 2 && !is_numeric(str_replace('.', '', $cookie_domain))) {
     ini_set('session.cookie_domain', $cookie_domain);
   }
+
+  // Use httponly session cookies.
+  ini_set('session.cookie_httponly', '1');
+
   session_name('SESS'. md5($session_name));
 }
 
@@ -557,7 +561,7 @@ function variable_del($name) {
 function page_get_cache() {
   global $user, $base_root;
 
-  if (page_is_cacheable()) {
+  if (drupal_page_is_cacheable()) {
     $cache = cache_get($base_root . request_uri(), 'cache_page');
 
     // Unserialize the cached page headers
@@ -571,14 +575,14 @@ function page_get_cache() {
   }
 }
 
-function page_is_cacheable($force = NULL) {
+function drupal_page_is_cacheable($force = NULL) {
   static $forced_cache = TRUE;
   if (isset($force)) {
     $forced_cache = $force;
   }
 
   $result = $forced_cache
-    && !drupal_session_is_started()
+    && !drupal_session_started()
     && ($_SERVER['REQUEST_METHOD'] == 'GET' || $_SERVER['REQUEST_METHOD'] == 'HEAD')
     && !count(drupal_get_messages(NULL, FALSE))
     && $_SERVER['SERVER_SOFTWARE'] !== 'PHP CLI';
@@ -650,6 +654,18 @@ function drupal_set_header($name = NULL, $value = NULL, $append = FALSE) {
 
   if (!isset($name)) {
     return $headers;
+  }
+  
+  // Support the Drupal 6 header API
+  if (!isset($value)) {
+    if (strpos($name, ':') !== FALSE) {
+      $parts = explode(':', $name);
+      $name = trim($parts[0]);
+      $value = trim($parts[1]);
+    }
+  }
+  if (substr($name, 0, 7) == 'HTTP/1.') {
+    $name = substr($name, 9);
   }
 
   // Save status codes using the special key ":status".
@@ -829,7 +845,7 @@ function drupal_page_cache_header(stdClass $cache) {
   // not bother caching the page in a public proxy, because the cached copy
   // will only be served to that particular user due to Vary: Cookie, unless
   // the Vary header has been replaced or unset in hook_boot() (see below).
-  $max_age = variable_get('cache', CACHE_NONE) == CACHE_AGGRESSIVE && (!isset($_COOKIE[session_name()]) || isset($hook_boot_headers['vary'])) ? variable_get('page_cache_max_age', 0) : 0;
+  $max_age = variable_get('cache', CACHE_DISABLED) == CACHE_AGGRESSIVE && (!isset($_COOKIE[session_name()]) || isset($hook_boot_headers['vary'])) ? variable_get('page_cache_max_age', 0) : 0;
   $default_headers['Cache-Control'] = 'public, max-age=' . $max_age;
 
   // Entity tag should change if the output changes.
@@ -1189,7 +1205,7 @@ function drupal_bootstrap($phase) {
 }
 
 function _drupal_bootstrap($phase) {
-  global $conf, $user;
+  global $conf, $user, $db_prefix;
 
   switch ($phase) {
 
@@ -1215,6 +1231,18 @@ function _drupal_bootstrap($phase) {
       break;
 
     case DRUPAL_BOOTSTRAP_DATABASE:
+      // The user agent header is used to pass a database prefix in the request when
+      // running tests. However, for security reasons, it is imperative that we
+      // validate we ourselves made the request.
+      $GLOBALS['simpletest_installed'] = TRUE;
+      if (isset($_SERVER['HTTP_USER_AGENT']) && (strpos($_SERVER['HTTP_USER_AGENT'], "simpletest") !== FALSE) && !drupal_valid_test_ua($_SERVER['HTTP_USER_AGENT'])) {
+        header($_SERVER['SERVER_PROTOCOL'] . ' 403 Forbidden');
+        exit;
+      }
+      if (isset($_SERVER['HTTP_USER_AGENT']) && preg_match("/^(simpletest\d+);/", $_SERVER['HTTP_USER_AGENT'], $matches)) {
+        $db_prefix .= $matches[1];
+      }
+
       // Initialize the default database.
       require_once './includes/database.inc';
       db_set_active();
@@ -1231,21 +1259,7 @@ function _drupal_bootstrap($phase) {
 
     case DRUPAL_BOOTSTRAP_SESSION:
       require_once variable_get('session_inc', './includes/session.inc');
-      session_set_save_handler('sess_open', 'sess_close', 'sess_read', 'sess_write', 'sess_destroy_sid', 'sess_gc');
-      // If a session cookie exists, initialize the session. Otherwise the
-      // session is only started on demand in drupal_session_start(), making
-      // anonymous users not use a session cookie unless something is stored in
-      // $_SESSION. This allows HTTP proxies to cache anonymous pageviews.
-      if (isset($_COOKIE[session_name()])) {
-        drupal_session_start();
-      }
-      else {
-        $user = drupal_anonymous_user();
-      }
-
-      // Register a shutdown handler to decide if we need to register a session.
-      register_shutdown_function('drupal_session_write');
-
+      drupal_session_initialize();
       break;
 
     case DRUPAL_BOOTSTRAP_LATE_PAGE_CACHE:
@@ -1280,7 +1294,7 @@ function _drupal_bootstrap($phase) {
         exit;
       }
   
-      if (!$cache && page_is_cacheable()) {
+      if (!$cache && drupal_page_is_cacheable()) {
         header('X-Drupal-Cache: MISS');
       }
 
@@ -1430,4 +1444,177 @@ function ip_address() {
   }
 
   return $ip_address;
+}
+
+/**
+ * Initialize the session handler, starting a session if needed.
+ */
+function drupal_session_initialize() {
+  global $user;
+   
+  session_set_save_handler('sess_open', 'sess_close', 'sess_read', 'sess_write', 'sess_destroy_sid', 'sess_gc');
+ 
+  if (isset($_COOKIE[session_name()])) {
+    // If a session cookie exists, initialize the session. Otherwise the
+    // session is only started on demand in drupal_session_commit(), making
+    // anonymous users not use a session cookie unless something is stored in
+    // $_SESSION. This allows HTTP proxies to cache anonymous pageviews.
+    drupal_session_start();
+    if (!empty($user->uid) || !empty($_SESSION)) {
+      drupal_page_is_cacheable(FALSE);
+    }
+  }
+  else {
+    // Set a session identifier for this request. This is necessary because
+    // we lazyly start sessions at the end of this request, and some
+    // processes (like drupal_get_token()) needs to know the future
+    // session ID in advance.
+    $user = drupal_anonymous_user();
+    session_id(md5(uniqid('', TRUE)));
+  }
+}
+
+/**
+ * Forcefully start a session, preserving already set session data.
+ */
+function drupal_session_start() {
+  if (!drupal_session_started()) {
+    // Save current session data before starting it, as PHP will destroy it.
+    $session_data = isset($_SESSION) ? $_SESSION : NULL;
+    session_start();
+    drupal_session_started(TRUE);
+    // Restore session data.
+    if (!empty($session_data)) {
+      $_SESSION += $session_data;
+    }
+  }
+}
+
+/**
+ * Commit the current session, if necessary.
+ *
+ * If an anonymous user already has an empty session, destroy it.
+ */
+function drupal_session_commit() {
+  global $user;
+
+  if (empty($user->uid) && empty($_SESSION)) {
+    if (drupal_session_started() && drupal_save_session()) {
+      // Destroy empty anonymous sessions.
+      session_destroy();
+    }
+  }
+  else if (drupal_save_session()) {
+    if (!drupal_session_started()) {
+      drupal_session_start();
+    }
+    // Write the session data.
+    session_write_close();
+  }
+}
+
+/**
+ * Return whether a session has been started.
+ */  
+function drupal_session_started($set = NULL) {
+  static $session_started = FALSE;
+  if (isset($set)) {
+    $session_started = $set;
+  }
+  return $session_started && session_id();
+}
+
+/**
+ * Called when an anonymous user becomes authenticated or vice-versa.
+ */
+function drupal_session_regenerate() {
+  global $user;
+
+  // Set the session cookie "httponly" flag to reduce the risk of session
+  // stealing via XSS.
+  extract(session_get_cookie_params());
+
+  if (version_compare(PHP_VERSION, '5.2.0') === 1) {
+    session_set_cookie_params($lifetime, $path, $domain, $secure, TRUE);
+  }
+  else {
+    session_set_cookie_params($lifetime, $path, $domain, $secure);
+  }
+
+  if (drupal_session_started()) {
+    $old_session_id = session_id();
+    session_regenerate_id();
+  }
+  else {
+    // Start the session when it doesn't exist yet.
+    // Preserve the logged in user, as it will be reset to anonymous
+    // by _sess_read.
+    $account = $user;
+    drupal_session_start();
+    $user = $account;
+  }
+
+  if (isset($old_session_id)) {
+    db_query('UPDATE {sessions} SET sid = "%s" WHERE sid = "%s"', session_id(), $old_session_id);
+  }
+}
+
+/**
+ * Determine whether to save session data of the current request.
+ *
+ * This function allows the caller to temporarily disable writing of
+ * session data, should the request end while performing potentially
+ * dangerous operations, such as manipulating the global $user object.
+ * See http://drupal.org/node/218104 for usage.
+ *
+ * @param $status
+ *   Disables writing of session data when FALSE, (re-)enables
+ *   writing when TRUE.
+ * @return
+ *   FALSE if writing session data has been disabled. Otherwise, TRUE.
+ */
+function drupal_save_session($status = NULL) {
+  static $save_session = TRUE;
+  if (isset($status)) {
+    $save_session = $status;
+  }
+  return $save_session;
+}
+
+/**
+ * Validate the HMAC and timestamp of a user agent header from simpletest.
+ */
+function drupal_valid_test_ua($user_agent) {
+  global $db_url;
+
+  list($prefix, $time, $salt, $hmac) = explode(';', $user_agent);
+  $check_string =  $prefix . ';' . $time . ';' . $salt;
+  // We use the database credentials from settings.php to make the HMAC key, since
+  // the database is not yet initialized and we can't access any Drupal variables.
+  // The file properties add more entropy not easily accessible to others.
+  $filepath = './includes/bootstrap.inc';
+  $key = sha1(serialize($db_url) . filectime($filepath) . fileinode($filepath), TRUE);
+  // The HMAC must match.
+  return $hmac == base64_encode(hash_hmac('sha1', $check_string, $key, TRUE));
+}
+
+/**
+ * Generate a user agent string with a HMAC and timestamp for simpletest.
+ */
+function drupal_generate_test_ua($prefix) {
+//  global $dbatabases;
+  global $db_url;
+  static $key;
+
+  if (!isset($key)) {
+    // We use the database credentials to make the HMAC key, since we
+    // check the HMAC before the database is initialized. filectime()
+    // and fileinode() are not easily determined from remote.
+    $filepath = './includes/bootstrap.inc';
+    $key = sha1(serialize($db_url) . filectime($filepath) . fileinode($filepath), TRUE);
+  }
+   // Generate a moderately secure HMAC based on the database credentials.
+   $salt = uniqid('', TRUE);
+   $check_string = $prefix . ';' . time() . ';' . $salt;
+   return  $check_string . ';' . base64_encode(hash_hmac('sha1', $check_string, $key, TRUE));
 }
