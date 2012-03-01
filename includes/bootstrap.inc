@@ -479,17 +479,27 @@ function drupal_get_filename($type, $name, $filename = NULL) {
  * with variable_set() as well as those explicitly specified in the configuration
  * file.
  */
-function variable_init($conf = array()) {
+function variable_init($conf = array(), $regenerate = FALSE) {
   // NOTE: caching the variables improves performance by 20% when serving cached pages.
-  if ($cached = cache_get('variables', 'cache')) {
+  if (!$regenerate && $cached = cache_get('variables', 'cache')) {
     $variables = $cached->data;
   }
   else {
-    $result = db_query('SELECT * FROM {variable}');
-    while ($variable = db_fetch_object($result)) {
-      $variables[$variable->name] = unserialize($variable->value);
+    if (lock_acquire('variable_cache_regenerate')) {
+      $result = db_query('SELECT * FROM {variable}');
+      while ($variable = db_fetch_object($result)) {
+        $variables[$variable->name] = unserialize($variable->value);
+      }
+      cache_set('variables', $variables);
+      lock_release('variable_cache_regenerate');
     }
-    cache_set('variables', $variables);
+    else {
+      // Wait for another request that is already doing this work.
+      lock_wait('variable_cache_regenerate');
+
+      // Run the function again.
+      return variable_init($conf, $regenerate);
+    }
   }
 
   foreach ($conf as $name => $value) {
@@ -537,9 +547,9 @@ function variable_set($name, $value) {
     @db_query("INSERT INTO {variable} (name, value) VALUES ('%s', '%s')", $name, $serialized_value);
   }
 
-  cache_clear_all('variables', 'cache');
-
   $conf[$name] = $value;
+
+  variable_cache_rebuild();
 }
 
 /**
@@ -557,9 +567,19 @@ function variable_del($name) {
 
   unset($conf[$name]);
 
-  cache_set('variables', $conf);
+  variable_cache_rebuild();
 }
 
+/**
+ * Schedules a rebuild of the variable cache on shutdown.
+ */
+function variable_cache_rebuild() {
+  static $shutdown_registered = FALSE;
+  if (!$shutdown_registered) {
+    register_shutdown_function('variable_init', array(), TRUE);
+    $shutdown_registered = TRUE;
+  }
+}
 
 /**
  * Retrieve the current page from the cache.
@@ -1309,6 +1329,9 @@ function _drupal_bootstrap($phase) {
       break;
 
     case DRUPAL_BOOTSTRAP_LATE_PAGE_CACHE:
+      require_once variable_get('lock_inc', './includes/lock.inc');
+      lock_init();
+
       // Initialize configuration variables, using values from settings.php if available.
       $conf = variable_init(isset($conf) ? $conf : array());
 
@@ -1488,18 +1511,18 @@ function ip_address() {
     // Only use parts of the X-Forwarded-For (XFF) header that have followed a trusted route.
     // Specifically, identify the leftmost IP address in the XFF header that is not one of ours.
     // An XFF header is: X-Forwarded-For: client1, proxy1, proxy2
-    if (isset($_SERVER['HTTP_X_FORWARDED_FOR']) && variable_get('reverse_proxy', 0)) {
+    if (isset($_SERVER['HTTP_' . variable_get('x_forwarded_for_header', 'X_FORWARDED_FOR')]) && variable_get('reverse_proxy', 0)) {
       // Load trusted reverse proxy server IPs.
       $reverse_proxy_addresses = variable_get('reverse_proxy_addresses', array());
       
       // Turn XFF header into an array.
-      $forwarded = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
-      
-      // Tack direct client IP onto end of forwarded array.
-      $forwarded[] = $ip_address;
+      $forwarded = explode(',', $_SERVER['HTTP_' . variable_get('x_forwarded_for_header', 'X_FORWARDED_FOR')]);
       
       // Trim the forwarded IPs; they may have been delimited by commas and spaces.
       $forwarded = array_map('trim', $forwarded);
+
+      // Tack direct client IP onto end of forwarded array.
+      $forwarded[] = $ip_address;
 
       // Eliminate all trusted IPs.
       $untrusted = array_diff($forwarded, $reverse_proxy_addresses);
